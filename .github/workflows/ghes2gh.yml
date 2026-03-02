@@ -1,69 +1,147 @@
-name: GHES to GitHub Migration (GEI)
+name: GHES → GHEC Migration via Actions (GEI)
 
 on:
   workflow_dispatch:
     inputs:
+      runner:
+        description: >
+          Runner selector. Use ubuntu-latest for GitHub-hosted.
+          For self-hosted, provide JSON array e.g. ["self-hosted","linux","x64","ghes-migration"].
+        required: true
+        default: "ubuntu-latest"
+
       csv_path:
-        description: Path to repos.csv in this repository
+        description: Path to repos.csv in this repository (root or scripts/)
         required: true
         default: repos.csv
+
       max_concurrent:
-        description: Max parallel migrations (GEI recommends <= 5)
+        description: Max parallel migrations (keep <= 5)
         required: true
-        default: '5'
-      use_github_storage:
-        description: Use GitHub-owned storage for GEI migrations (recommended when available)
-        required: true
-        default: 'true'
+        default: "5"
+
+      # use_github_storage:
+      #   description: Pass --use-github-storage to GEI (if enabled for your org)
+      #   required: true
+      #   default: "true"
+
       # target_api_url:
-      #   description: Optional target API URL (for GHE.com data residency, e.g. https://api.SUBDOMAIN.ghe.com)
+      #   description: Optional (GHE.com data residency): https://api.SUBDOMAIN.ghe.com
       #   required: false
-      #   default: ''
-      run_readiness:
-        description: Run pre-migration readiness checks (PRs, workflows, issues)
-        required: true
-        default: 'true'
-      run_migration:
-        description: Run migrations
-        required: true
-        default: 'true'
-      run_validation:
-        description: Run post-migration validation (branches + commit counts)
-        required: true
-        default: 'true'
+      #   default: ""
+
+env:
+  # gh CLI auth in Actions
+  GH_TOKEN: ${{ secrets.GH_TOKEN }}
+
+  # GEI + scripts
+  GH_PAT: ${{ secrets.GH_PAT }}
+  GH_SOURCE_PAT: ${{ secrets.GH_SOURCE_PAT }}
+  GHES_API_URL: ${{ secrets.GHES_API_URL }}
+
+  # Optional migration behavior (supported by our migration runner)
+  USE_GITHUB_STORAGE: ${{ inputs.use_github_storage }}
+  TARGET_API_URL: ${{ inputs.target_api_url }}
 
 jobs:
-  migrate:
-    # NOTE: For on-prem GHES, you may need a self-hosted runner that can reach GHES over the network.
-    runs-on: ubuntu-latest
-
-    permissions:
-      contents: read
-
-    env:
-      # gh CLI uses GH_TOKEN for authentication. We wire it to GH_TOKEN secret.
-      GH_TOKEN: ${{ secrets.GH_TOKEN }}
-      # GEI extension reads these for source/target auth.
-      GH_PAT: ${{ secrets.GH_PAT }}
-      GH_SOURCE_PAT: ${{ secrets.GH_SOURCE_PAT }}
-      GHES_API_URL: ${{ secrets.GHES_API_URL }}
-      # Optional behavior for our migration runner
-      USE_GITHUB_STORAGE: ${{ inputs.use_github_storage }}
-      # TARGET_API_URL: ${{ inputs.target_api_url }}
+  pre_migration_validation:
+    name: Stage 1 - Pre-migration validation
+    runs-on: ${{ inputs.runner == 'ubuntu-latest' && 'ubuntu-latest' || fromJson(inputs.runner) }}
+    environment: pre-migration-validation
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install prerequisites
+      # Keep GitHub-hosted friendly; self-hosted should preinstall tools
+      - name: Install prerequisites (GitHub-hosted only)
+        if: ${{ inputs.runner == 'ubuntu-latest' }}
         shell: bash
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y jq
-          if ! command -v gh >/dev/null 2>&1; then
-            sudo apt-get install -y gh
-          fi
+          sudo apt-get install -y jq gh
+          gh --version
+          jq --version
+
+      - name: Make scripts executable
+        shell: bash
+        run: chmod +x scripts/*.sh
+
+      # Your readiness script reads repos.csv from the script directory (scripts/repos.csv) [4](https://oneuptime.com/blog/post/2026-01-25-github-actions-environment-protection-rules/view)
+      - name: Prepare repos.csv for scripts
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp "${{ inputs.csv_path }}" scripts/repos.csv
+          echo "✅ CSV prepared: ${{ inputs.csv_path }} → scripts/repos.csv"
+
+      - name: (Optional) Connectivity check to GHES API
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Checking GHES API reachability..."
+          curl -fsSL -H "Authorization: token ${GH_SOURCE_PAT}" "${GHES_API_URL%/}/user" >/dev/null
+          echo "✅ GHES API reachable"
+
+      - name: Run pre-migration readiness checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./scripts/1_migration-readiness.sh | tee precheck.log
+
+      - name: Publish stage summary (pre-validation)
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## ✅ Stage 1: Pre-migration validation"
+            echo ""
+            echo "**CSV:** \`${{ inputs.csv_path }}\` (copied to \`scripts/repos.csv\`)"
+            echo ""
+            echo "### Consolidated summary"
+            # These lines are printed by your script [4](https://oneuptime.com/blog/post/2026-01-25-github-actions-environment-protection-rules/view)
+            grep -E "Total Repositories Processed:|Repositories with Active Pull Requests:|Repositories with Workflows \\(Running or Queued\\):|Repositories with Open Issues:" precheck.log \
+              | sed 's/^/- /' || true
+            echo ""
+            echo "### Notes"
+            echo "- If Stage 2 is configured with required reviewers, an approval will be required before migration."
+            echo ""
+            echo "### Artifacts"
+            echo "- \`precheck.log\` and \`scripts/repos.csv\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload pre-validation artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stage1-precheck-${{ github.run_id }}
+          path: |
+            precheck.log
+            scripts/repos.csv
+          if-no-files-found: warn
+
+
+  migration:
+    name: Stage 2 - Migration (requires approval)
+    runs-on: ${{ inputs.runner == 'ubuntu-latest' && 'ubuntu-latest' || fromJson(inputs.runner) }}
+    needs: pre_migration_validation
+
+    # ✅ APPROVAL GATE:
+    # Configure Settings → Environments → "migration" → Required reviewers. [3](https://docs.github.com/en/migrations/using-github-enterprise-importer/migrating-between-github-products/migrating-repositories-from-github-enterprise-server-to-github-enterprise-cloud)
+    environment: migration
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install prerequisites (GitHub-hosted only)
+        if: ${{ inputs.runner == 'ubuntu-latest' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y jq gh
           gh --version
           jq --version
 
@@ -78,35 +156,137 @@ jobs:
         shell: bash
         run: chmod +x scripts/*.sh
 
-      - name: Pre-migration readiness checks
-        if: ${{ inputs.run_readiness == 'true' }}
+      - name: Prepare repos.csv for scripts
         shell: bash
         run: |
           set -euo pipefail
-          ./scripts/1_migration-readiness.sh
+          cp "${{ inputs.csv_path }}" scripts/repos.csv
+          echo "✅ CSV prepared: ${{ inputs.csv_path }} → scripts/repos.csv"
 
-      - name: Run migrations (parallel)
-        if: ${{ inputs.run_migration == 'true' }}
+      - name: Run migration (parallel)
         shell: bash
         run: |
           set -euo pipefail
-          ./scripts/2_migration.sh --max-concurrent "${{ inputs.max_concurrent }}" --csv "${{ inputs.csv_path }}" --output repo_migration_output.csv
+          # Your migration runner supports --max-concurrent, --csv, --output [6](https://www.youtube.com/watch?v=LS2lq1vMFws)
+          ./scripts/2_migration.sh \
+            --max-concurrent "${{ inputs.max_concurrent }}" \
+            --csv "scripts/repos.csv" \
+            --output repo_migration_output.csv \
+            | tee migration.log
 
-      - name: Post-migration validation
-        if: ${{ inputs.run_validation == 'true' }}
+      - name: Publish stage summary (migration)
+        if: always()
         shell: bash
         run: |
-          set -euo pipefail
-          ./scripts/3_post_migration_validation.sh
+          {
+            echo "## 🚀 Stage 2: Migration"
+            echo ""
+            echo "**Concurrency:** \`${{ inputs.max_concurrent }}\`"
+            echo "**GitHub-owned storage:** \`${{ inputs.use_github_storage }}\`"
+            echo "**Target API URL:** \`${{ inputs.target_api_url }}\`"
+            echo ""
+
+            if [[ -f repo_migration_output.csv ]]; then
+              echo "### Result counts (from repo_migration_output.csv)"
+              success=$(awk -F',' 'NR>1 && $6 ~ /Success/ {c++} END{print c+0}' repo_migration_output.csv)
+              failure=$(awk -F',' 'NR>1 && $6 ~ /Failure/ {c++} END{print c+0}' repo_migration_output.csv)
+              pending=$(awk -F',' 'NR>1 && $6 ~ /Pending/ {c++} END{print c+0}' repo_migration_output.csv)
+              inprog=$(awk -F',' 'NR>1 && $6 ~ /In Progress/ {c++} END{print c+0}' repo_migration_output.csv)
+              echo "- ✅ Success: **$success**"
+              echo "- ❌ Failure: **$failure**"
+              echo "- ⏳ Pending: **$pending**"
+              echo "- 🔄 In Progress: **$inprog**"
+              echo ""
+              echo "### Outputs"
+              echo "- \`repo_migration_output.csv\` (uploaded as artifact)"
+              echo "- \`migration-*.txt\` per repo logs (uploaded as artifact)"
+            else
+              echo "> [!CAUTION]"
+              echo "> \`repo_migration_output.csv\` not found. Check \`migration.log\`."
+            fi
+
+            echo ""
+            echo "### Artifacts"
+            echo "- \`migration.log\`, \`repo_migration_output.csv\`, \`migration-*.txt\`"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload migration artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: ghes2gh-migration-artifacts-${{ github.run_id }}
+          name: stage2-migration-${{ github.run_id }}
           path: |
-            repo_migration_output*.csv
+            migration.log
+            repo_migration_output.csv
             migration-*.txt
+          if-no-files-found: warn
+
+
+  post_migration_validation:
+    name: Stage 3 - Post-migration validation
+    runs-on: ${{ inputs.runner == 'ubuntu-latest' && 'ubuntu-latest' || fromJson(inputs.runner) }}
+    needs: migration
+    environment: post-migration-validation
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install prerequisites (GitHub-hosted only)
+        if: ${{ inputs.runner == 'ubuntu-latest' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y jq gh
+          gh --version
+          jq --version
+
+      - name: Make scripts executable
+        shell: bash
+        run: chmod +x scripts/*.sh
+
+      - name: Prepare repos.csv for scripts
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp "${{ inputs.csv_path }}" scripts/repos.csv
+          echo "✅ CSV prepared: ${{ inputs.csv_path }} → scripts/repos.csv"
+
+      - name: Run post-migration validation
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Validation script reads repos.csv and writes validation-log-YYYYMMDD.txt [5](https://docs.github.com/en/actions/reference/workflows-and-actions/deployments-and-environments)
+          ./scripts/3_post_migration_validation.sh | tee post_validation.log
+
+      - name: Publish stage summary (post-validation)
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## 🔎 Stage 3: Post-migration validation"
+            echo ""
+            echo "### Quick indicators"
+            echo "- ❌ ERROR lines: **$(grep -c \"ERROR\" post_validation.log || true)**"
+            echo "- ⚠️ ❌ Not Matching lines: **$(grep -c \"❌ Not Matching\" post_validation.log || true)**"
+            echo ""
+            echo "### Logs"
+            echo "- \`post_validation.log\`"
+            echo "- \`validation-log-*.txt\`"
+            echo "- \`validation-*.json\`"
+            echo ""
+            echo "### Artifacts"
+            echo "- Uploaded as stage3-postvalidation-${{ github.run_id }}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload post-validation artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stage3-postvalidation-${{ github.run_id }}
+          path: |
+            post_validation.log
             validation-log-*.txt
             validation-*.json
           if-no-files-found: warn
