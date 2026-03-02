@@ -6,8 +6,7 @@ on:
       runner:
         description: >
           Runner selector. Use ubuntu-latest for GitHub-hosted.
-          For self-hosted, provide JSON labels e.g. ["self-hosted","linux","x64","ghes-migration"].
-          NOTE: GitHub selects self-hosted runners by LABELS, not by runner machine name.
+          For self-hosted, provide JSON labels
         required: true
         default: "ubuntu-latest"
 
@@ -21,15 +20,15 @@ on:
         required: true
         default: "5"
 
-      use_github_storage:
-        description: Pass --use-github-storage to GEI (if enabled for your org)
-        required: true
-        default: "true"
+      # use_github_storage:
+      #   description: Pass --use-github-storage to GEI (if enabled for your org)
+      #   required: true
+      #   default: "true"
 
-      target_api_url:
-        description: Optional (GHE.com data residency): https://api.SUBDOMAIN.ghe.com
-        required: false
-        default: ""
+      # target_api_url:
+      #   description: Optional (GHE.com data residency): https://api.SUBDOMAIN.ghe.com
+      #   required: false
+      #   default: ""
 
       run_pre_validation:
         description: Run Stage 1 - pre-migration validation
