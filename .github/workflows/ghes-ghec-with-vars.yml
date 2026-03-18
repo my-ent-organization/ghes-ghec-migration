@@ -678,18 +678,76 @@ jobs:
           # Your script defaults CSV_FILE=repos.csv, so we explicitly point it to scripts/repos.csv
           export CSV_FILE="scripts/repos.csv"
           ./scripts/ghes-ghec-var_mig.sh 2>&1 | tee vars_migration.log
-
-      - name: Publish Stage 4 summary
+      
+      - name: Publish Stage 4 vars migration summary
         if: always()
         shell: bash
         run: |
           {
-            echo "## 🔁 Stage 4 - Variables Migration"
+            echo "## 🔁 Stage 4 — Variables Migration Summary"
             echo ""
-            echo "- **Script:** \`scripts/ghes-ghec-var_mig.sh\`"
-            echo "- **CSV_FILE:** \`scripts/repos.csv\`"
-            echo "- **Log Artifact:** \`vars_migration.log\`"
+
+            echo "### 📌 Execution status"
+            if grep -q "Starting GHES -> GHEC Full Migration" vars_migration.log; then
+              echo "- ✅ Script started"
+            else
+              echo "- ❌ Script did not start"
+            fi
+
+            if grep -q "Migration Complete" vars_migration.log; then
+              echo "- ✅ Script completed successfully"
+            else
+              echo "- ❌ Script exited before completion"
+            fi
+
+            echo ""
+            echo "### 📦 Repositories processed"
+            grep -E "Processing:" vars_migration.log | sed 's/^/- /' || echo "- ❌ None"
+
+            echo ""
+            echo "### 🏢 Org Variables"
+            if grep -q "Syncing Org Vars" vars_migration.log; then
+              echo "- ✅ Org variables sync attempted"
+            else
+              echo "- ⚠️ Org variables step not reached"
+            fi
+
+            echo ""
+            echo "### 📁 Repo Variables"
+            if grep -q "Syncing Repo Vars" vars_migration.log; then
+              echo "- ✅ Repo variables sync attempted"
+            else
+              echo "- ⚠️ Repo variables step not reached"
+            fi
+
+            echo ""
+            echo "### 🌱 Environment Rules"
+            grep -E "rules synced" vars_migration.log | sed 's/^/- /' || echo "- ⚠️ No environment rules synced"
+
+            echo ""
+            echo "### 🔐 Environment Variables"
+            grep -E "Env Var:" vars_migration.log | sed 's/^/- /' || echo "- ⚠️ No environment variables synced"
+
+            echo ""
+            echo "### ❌ Failure point (if any)"
+            grep -E "Error:|401|403|404" vars_migration.log | sed 's/^/- /' || echo "- ✅ No explicit API error logged"
+
+            echo ""
+            echo "### 📄 Artifacts"
+            echo "- \`vars_migration.log\` (full execution log)"
           } >> "$GITHUB_STEP_SUMMARY"
+          
+      # - name: Publish Stage 4 summary
+      #   if: always()
+      #   shell: bash
+      #   run: |
+      #     {
+      #       echo "## 🔁 Stage 4 - Variables Migration"
+      #       echo ""
+      #       echo "- **Script:** \`scripts/ghes-ghec-var_mig.sh\`"
+      #       echo "- **CSV_FILE:** \`scripts/repos.csv\`"
+      #       echo "- **Log Artifact:** \`vars_migration.log\`"
+      #     } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload vars migration artifacts
         if: always()
