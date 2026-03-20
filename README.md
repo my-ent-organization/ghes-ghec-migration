@@ -119,8 +119,11 @@ Required columns for migration:
 ## Running the workflow
 
 1. Generate or update `repos.csv` and commit it to the repository.
-2. Go to **Actions → ghes-to-github-migration (staged) → Run workflow**.
+2. Go to **Actions → ghes-to-github-migration (staged) or (with vars) → Run workflow**.
+    (staged) - will not migrate Org/Repo vars & Environments
+    (With Vars) - will migrate Org/Repo vars & Environments and Protection rule.
 3. Provide workflow inputs:
+   - `runner selectopr` : Runner selector. Use ubuntu-latest for GitHub-hosted. eg["self-hosted","linux","x64","ghes-migration"].
    - `csv_path`: path to your CSV (default: `repos.csv`)
    - `max_concurrent`: keep `≤ 5`
    - `approver`: GitHub username(s) who must approve the migration gate
