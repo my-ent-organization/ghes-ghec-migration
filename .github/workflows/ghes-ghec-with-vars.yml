@@ -115,7 +115,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          echo $GH_PAT | gh auth login --hostname $GH_TARGET_HOST
+          echo $GH_PAT | gh auth login --hostname $GH_TARGET_HOST --with-token
           gh extension install https://github.com/github/gh-gei
           gh extension upgrade https://github.com/github/gh-gei
           gh gei --help >/dev/null
