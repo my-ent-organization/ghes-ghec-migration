@@ -1,225 +1,324 @@
-#!/usr/bin/env pwsh
-Set-StrictMode -Version Latest
-$ErrorActionPreference = "Stop"
-# ============================================================
-# GHES -> GHEC: COMPLETE SYNC (ORG, REPO, ENV VARS + RULES)
-# ============================================================
+# GHES -> GitHub parallel migration runner (GitHub Actions optimized)
+# - Configurable via parameters for GitHub Actions workflow
+# - Keeps your status bar and CSV writes
+# - Streams logs from files (delta-only) while jobs run
+# - Ensures background job emits only the final result object (no log noise on the output stream)
+# - Robust Receive-Job parsing so $failed increments correctly
+#
+# Expected repos.csv schema columns (source + target):
+# ghes_org, ghes_repo, github_org, github_repo, gh_repo_visibility
+# Other columns are ignored. (e.g. repo_url, repo_size_MB)
+#
+# Requires env vars:
+# GH_SOURCE_PAT (source GHES token)
+# GH_PAT (target GitHub token)
+# GHES_API_URL (e.g. https://ghe.example.com/api/v3)
+#
+# Uses GEI CLI: gh gei migrate-repo ... --ghes-api-url ... --target-repo-visibility ...
+param(
+  [Parameter(Mandatory=$false)]
+  [int]$MaxConcurrent = 5,
 
-# Env inputs (match bash behavior)
-$CSV_FILE = if ($env:CSV_FILE) { $env:CSV_FILE } else { "repos.csv" }
-$GH_PAT = $env:GH_PAT; if (-not $GH_PAT) { throw "Set GH_PAT" }
-$GH_SOURCE_PAT = $env:GH_SOURCE_PAT; if (-not $GH_SOURCE_PAT) { throw "Set GH_SOURCE_PAT" }
-$GHES_API_URL = $env:GHES_API_URL; if (-not $GHES_API_URL) { throw "Set GHES_API_URL" }
-$TARGET_HOST = if ($env:GH_TARGET_HOST) { $env:GH_TARGET_HOST } else { "github.com" }
+  [Parameter(Mandatory=$false)]
+  [string]$CsvPath = "repos.csv",
 
-# Headers (same as bash)
-$GH_HEADERS = @(
-  "-H", "Accept: application/vnd.github+json",
-  "-H", "X-GitHub-Api-Version: 2022-11-28"
+  [Parameter(Mandatory=$false)]
+  [string]$OutputPath = ""
 )
 
-function Log([string]$Message) {
-  $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-  Write-Host "[$ts] $Message"
+# -------------------- Settings --------------------
+# Validate max concurrent limit
+if ($MaxConcurrent -gt 5) {
+  Write-Host "[ERROR] Maximum concurrent migrations ($MaxConcurrent) exceeds the allowed limit of 5." -ForegroundColor Red
+  Write-Host "[ERROR] Please set MaxConcurrent to 5 or less." -ForegroundColor Red
+  exit 1
+}
+if ($MaxConcurrent -lt 1) {
+  Write-Host "[ERROR] MaxConcurrent must be at least 1." -ForegroundColor Red
+  exit 1
 }
 
-# --- Parse SOURCE_HOST from GHES_API_URL (scheme optional) ---
-$sourceUrlText = $GHES_API_URL
-if ($sourceUrlText -notmatch "^\w+://") { $sourceUrlText = "https://$sourceUrlText" }
-$sourceUri = [Uri]$sourceUrlText
-$SOURCE_HOST = if ($sourceUri.IsDefaultPort) { $sourceUri.Host } else { "$($sourceUri.Host):$($sourceUri.Port)" }
-
-function UrlEncode([string]$s) {
-  return [Uri]::EscapeDataString($s)
+# Validate required environment variables (GEI)
+if ([string]::IsNullOrWhiteSpace($env:GH_SOURCE_PAT)) {
+  Write-Host "[ERROR] Environment variable GH_SOURCE_PAT is not set." -ForegroundColor Red
+  exit 1
+}
+if ([string]::IsNullOrWhiteSpace($env:GH_PAT)) {
+  Write-Host "[ERROR] Environment variable GH_PAT is not set." -ForegroundColor Red
+  exit 1
+}
+if ([string]::IsNullOrWhiteSpace($env:GHES_API_URL)) {
+  Write-Host "[ERROR] Environment variable GHES_API_URL is not set (example: https://ghe.example.com/api/v3)." -ForegroundColor Red
+  exit 1
 }
 
-function Invoke-GhApi {
-  param(
-    [Parameter(Mandatory=$true)][string]$HostName,
-    [Parameter(Mandatory=$true)][string]$Token,
-    [Parameter(Mandatory=$true)][string[]]$Args,
-    [string]$Stdin = $null
-  )
-  $old = $env:GH_TOKEN
-  try {
-    $env:GH_TOKEN = $Token
-    if ($null -ne $Stdin) {
-      $out = $Stdin | & gh api --hostname $HostName @GH_HEADERS @Args 2>$null
-    } else {
-      $out = & gh api --hostname $HostName @GH_HEADERS @Args 2>$null
-    }
-    return $out
+# Normalize GHES API URL (remove trailing slash)
+$env:GHES_API_URL = $env:GHES_API_URL.TrimEnd('/')
+
+# -------------------- DR-aware TARGET_API_URL --------------------
+# If GH_TARGET_HOST is set, treat destination as Data Residency (GHE.com) and set target api url as https://api.<GH_TARGET_HOST>
+# Else default to https://api.github.com
+# If TARGET_API_URL is explicitly set already, keep it (no behavior break).
+$targetApiUrl =
+if (-not [string]::IsNullOrWhiteSpace($env:TARGET_API_URL)) {
+  $env:TARGET_API_URL
+}
+elseif (-not [string]::IsNullOrWhiteSpace($env:GH_TARGET_HOST)) {
+  "https://api.$($env:GH_TARGET_HOST)"
+}
+else {
+  "https://api.github.com"
+}
+
+# Output file
+$timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+if ([string]::IsNullOrWhiteSpace($OutputPath)) {
+  $outputCsvPath = "repo_migration_output-$timestamp.csv"
+} else {
+  $outputCsvPath = $OutputPath
+}
+
+# CSV exists?
+if (-not (Test-Path -Path $CsvPath)) {
+  Write-Host "[ERROR] CSV file not found at path: $CsvPath" -ForegroundColor Red
+  exit 1
+}
+
+# Load CSV
+$REOSource = Import-Csv -Path $CsvPath
+if ($REOSource.Count -eq 0) {
+  Write-Host "[ERROR] CSV file is empty: $CsvPath" -ForegroundColor Red
+  exit 1
+}
+
+# Convert to ArrayList for mutation-friendly operations later
+$REPOS = New-Object System.Collections.ArrayList
+foreach ($repo in $REOSource) { [void]$REPOS.Add($repo) }
+
+# Validate required columns for GHES -> GitHub
+$requiredColumns = @('ghes_org', 'ghes_repo', 'github_org', 'github_repo', 'gh_repo_visibility')
+$firstRepo = $REPOS[0]
+$missingColumns = $requiredColumns | Where-Object { $_ -notin $firstRepo.PSObject.Properties.Name }
+if ($missingColumns) {
+  Write-Host "[ERROR] CSV is missing required columns: $($missingColumns -join ', ')" -ForegroundColor Red
+  Write-Host "[ERROR] Required columns: $($requiredColumns -join ', ')" -ForegroundColor Red
+  exit 1
+}
+
+# Ensure expected columns exist / initialize
+foreach ($repo in $REPOS) {
+  if ($repo.PSObject.Properties["Migration_Status"]) {
+    $repo.Migration_Status = "Pending"
+  } else {
+    $repo | Add-Member -NotePropertyName Migration_Status -NotePropertyValue "Pending"
   }
-  finally {
-    $env:GH_TOKEN = $old
+
+  if ($repo.PSObject.Properties["Log_File"]) {
+    $repo.Log_File = ""
+  } else {
+    $repo | Add-Member -NotePropertyName Log_File -NotePropertyValue ""
   }
 }
 
-function Gh-Source {
-  param([Parameter(Mandatory=$true)][string[]]$Args, [string]$Stdin = $null)
-  return Invoke-GhApi -HostName $SOURCE_HOST -Token $GH_SOURCE_PAT -Args $Args -Stdin $Stdin
+function Write-MigrationStatusCsv {
+  $REPOS | Export-Csv -Path $outputCsvPath -NoTypeInformation
 }
 
-function Gh-Target {
-  param([Parameter(Mandatory=$true)][string[]]$Args, [string]$Stdin = $null)
-  return Invoke-GhApi -HostName $TARGET_HOST -Token $GH_PAT -Args $Args -Stdin $Stdin
+Write-MigrationStatusCsv
+Write-Host "[INFO] Starting migration with $MaxConcurrent concurrent jobs..."
+Write-Host "[INFO] Processing $($REPOS.Count) repositories from: $CsvPath" -ForegroundColor Cyan
+Write-Host "[INFO] Initialized migration status output: $outputCsvPath" -ForegroundColor Cyan
+
+# -------------------- MAIN: parallel migration with concurrent jobs --------------------
+$queue = [System.Collections.ArrayList]@($REPOS)
+$inProgress = [System.Collections.ArrayList]@()
+$migrated = [System.Collections.ArrayList]@()
+$failed = [System.Collections.ArrayList]@()
+$script:StatusLineWidth = 0
+
+function Show-StatusBar {
+  param($queue, $inProgress, $migrated, $failed)
+
+  $queueCount = $queue.Count
+  $progressCount = $inProgress.Count
+  $migratedCount = $migrated.Count
+  $failedCount = $failed.Count
+
+  $statusLine = "QUEUE: $queueCount "
+  $statusLine += "IN PROGRESS: $progressCount "
+  $statusLine += "MIGRATED: $migratedCount "
+  $statusLine += "MIGRATION FAILED: $failedCount"
+
+  if ($statusLine.Length -gt $script:StatusLineWidth) {
+    $script:StatusLineWidth = $statusLine.Length
+  }
+  $statusLine = $statusLine.PadRight($script:StatusLineWidth)
+  Write-Host "`r$statusLine" -NoNewline -ForegroundColor Cyan
 }
 
-function Get-ReviewerId {
-  param([Parameter(Mandatory=$true)][string]$Handle)
-  try {
-    $json = Gh-Target -Args @("/users/$Handle")
-    $obj = $json | ConvertFrom-Json
-    if ($null -ne $obj.id) { return [string]$obj.id }
-  } catch { }
-  return ""
-}
+while ($queue.Count -gt 0 -or $inProgress.Count -gt 0) {
 
-function Sync-EnvironmentData {
-  param(
-    [Parameter(Mandatory=$true)][string]$SrcFull,
-    [Parameter(Mandatory=$true)][string]$TgtFull,
-    [Parameter(Mandatory=$true)][string]$EnvName,
-    [string]$ReviewerHandle
-  )
+  # Start new jobs if below max concurrent
+  while ($inProgress.Count -lt $MaxConcurrent -and $queue.Count -gt 0) {
 
-  $env_enc = UrlEncode $EnvName
+    $repo = $queue[0]
+    $queue.RemoveAt(0)
 
-  # --- 1. SYNC PROTECTION RULES ---
-  $src_env_json = "{}"
-  try {
-    $tmp = Gh-Source -Args @("/repos/$SrcFull/environments/$env_enc")
-    if ($tmp) { $src_env_json = $tmp } else { $src_env_json = "{}" }
-  } catch { $src_env_json = "{}" }
+    $ghesOrg = $repo.ghes_org
+    $ghesRepo = $repo.ghes_repo
+    $githubOrg = $repo.github_org
+    $githubRepo = $repo.github_repo
+    $visibility = $repo.gh_repo_visibility
 
-  $reviewer_id = ""
-  if ($ReviewerHandle) { $reviewer_id = Get-ReviewerId -Handle $ReviewerHandle }
+    # Create log file (per repo)
+    $logFile = "migration-$githubRepo-$(Get-Date -Format 'yyyyMMdd-HHmmss').txt"
 
-  $payloadObj = @{}
-  try {
-    $src = $src_env_json | ConvertFrom-Json
-    $rules = @()
-    if ($null -ne $src.protection_rules) { $rules = @($src.protection_rules) }
-    foreach ($r in $rules) {
-      if ($null -eq $r) { continue }
-      if ($r.type -eq "wait_timer") {
-        $payloadObj["wait_timer"] = if ($null -ne $r.wait_timer) { [int]$r.wait_timer } else { 0 }
+    # Ensure log directory exists (if any)
+    $logDir = Split-Path -Path $logFile
+    if ($logDir) { $null = New-Item -ItemType Directory -Force -Path $logDir }
+
+    $repo.Log_File = $logFile
+    Write-MigrationStatusCsv
+
+    # Background job script: emits ONLY @{ MigrationSuccess = <bool> }
+    $scriptBlock = {
+      param($ghesOrg, $ghesRepo, $githubOrg, $githubRepo, $visibility, $logFile, $workDir, $ghesApiUrl, $targetApiUrl)
+
+      Set-Location -Path $workDir
+
+      function Migrate-Repository {
+        param (
+          [string]$ghesOrg,
+          [string]$ghesRepo,
+          [string]$githubOrg,
+          [string]$githubRepo,
+          [string]$visibility,
+          [string]$logFile,
+          [string]$ghesApiUrl,
+          [string]$targetApiUrl
+        )
+
+        "[{0}] [START] Migration: {1}/{2} -> {3}/{4} (visibility: {5})" -f (Get-Date), $ghesOrg, $ghesRepo, $githubOrg, $githubRepo, $visibility |
+          Tee-Object -FilePath $logFile -Append | Out-Null
+
+        "[{0}] [DEBUG] Running: gh gei migrate-repo --github-source-org {1} --source-repo {2} --github-target-org {3} --target-repo {4} --target-repo-visibility {5} --ghes-api-url {6} --target-api-url {7}" -f (Get-Date), $ghesOrg, $ghesRepo, $githubOrg, $githubRepo, $visibility, $ghesApiUrl, $targetApiUrl |
+          Tee-Object -FilePath $logFile -Append | Out-Null
+
+        & gh gei migrate-repo `
+          --github-source-org $ghesOrg `
+          --source-repo $ghesRepo `
+          --github-target-org $githubOrg `
+          --target-repo $githubRepo `
+          --target-repo-visibility $visibility `
+          --ghes-api-url $ghesApiUrl `
+          --target-api-url $targetApiUrl *>&1 |
+          Tee-Object -FilePath $logFile -Append | Out-Null
+
+        $migrateExit = $LASTEXITCODE
+
+        # Check for markers in the log (same behavior as your bash runner)
+        $logContent = Get-Content -Path $logFile -Raw
+        if ($logContent -match "No operation will be performed") {
+          return $false # keep behavior as Failure; change to $null for "Skipped"
+        }
+
+        # GEI often includes "State: SUCCEEDED" (keep tolerant check)
+        if ($logContent -notmatch "State:\s*SUCCEEDED" -and $logContent -notmatch "\bSUCCEEDED\b") {
+          return $false
+        }
+
+        if ($migrateExit -eq 0) {
+          "[{0}] [SUCCESS] Migration: {1}/{2} -> {3}/{4}" -f (Get-Date), $ghesOrg, $ghesRepo, $githubOrg, $githubRepo |
+            Tee-Object -FilePath $logFile -Append | Out-Null
+          return $true
+        } else {
+          "[{0}] [FAILED] Migration: {1}/{2} -> {3}/{4}" -f (Get-Date), $ghesOrg, $ghesRepo, $githubOrg, $githubRepo |
+            Tee-Object -FilePath $logFile -Append | Out-Null
+          return $false
+        }
       }
-      if ($r.type -eq "required_reviewers" -and $reviewer_id) {
-        $payloadObj["reviewers"] = @(@{ type = "User"; id = [int]$reviewer_id })
-        $payloadObj["prevent_self_review"] = if ($null -ne $r.prevent_self_review) { [bool]$r.prevent_self_review } else { $false }
-      }
+
+      $migrationSuccess = Migrate-Repository -ghesOrg $ghesOrg -ghesRepo $ghesRepo -githubOrg $githubOrg -githubRepo $githubRepo -visibility $visibility -logFile $logFile -ghesApiUrl $ghesApiUrl -targetApiUrl $targetApiUrl
+      return @{ MigrationSuccess = $migrationSuccess }
     }
-  } catch { $payloadObj = @{} }
 
-  $payload = ($payloadObj | ConvertTo-Json -Compress)
-  Gh-Target -Args @("-X","PUT","/repos/$TgtFull/environments/$env_enc","--input","-") -Stdin $payload | Out-Null
-  Log " + Env '$EnvName' rules synced."
+    # Start background job
+    $workDir = (Get-Location).Path
+    $job = Start-Job -ScriptBlock $scriptBlock -ArgumentList $ghesOrg, $ghesRepo, $githubOrg, $githubRepo, $visibility, $logFile, $workDir, $env:GHES_API_URL, $targetApiUrl
 
-  # --- 2. SYNC ENVIRONMENT VARIABLES ---
-  $src_repo_id = ((Gh-Source -Args @("/repos/$SrcFull")) | ConvertFrom-Json).id
-  $tgt_repo_id = ((Gh-Target -Args @("/repos/$TgtFull")) | ConvertFrom-Json).id
+    $null = $inProgress.Add([PSCustomObject]@{
+      Job = $job
+      Repo = $repo
+      LogFile = $logFile
+      LastOutputLength = 0 # track how much of the log we've printed
+    })
 
-  $varsJson = $null
-  try { $varsJson = Gh-Source -Args @("/repositories/$src_repo_id/environments/$env_enc/variables") } catch { $varsJson = $null }
+    Show-StatusBar -queue $queue -inProgress $inProgress -migrated $migrated -failed $failed
+  }
 
-  if ($varsJson) {
-    $varsObj = $varsJson | ConvertFrom-Json
-    $vars = @()
-    if ($null -ne $varsObj.variables) { $vars = @($varsObj.variables) }
-    foreach ($v in $vars) {
-      $vname = [string]$v.name
-      $vval = [string]$v.value
+  # --- Stream new output from each job's log file to the console ---
+  foreach ($item in @($inProgress)) {
+    if (Test-Path -Path $item.LogFile) {
       try {
-        Gh-Target -Args @("-X","POST","/repositories/$tgt_repo_id/environments/$env_enc/variables","-f","name=$vname","-f","value=$vval") | Out-Null
-      } catch {
-        Gh-Target -Args @("-X","PATCH","/repositories/$tgt_repo_id/environments/$env_enc/variables/$vname","-f","name=$vname","-f","value=$vval") | Out-Null
-      }
-      Log " - Env Var: $vname synced"
-    }
-  }
-}
-
-function Main {
-  Log "Starting GHES -> GHEC Full Migration"
-  $seen_orgs = @{}
-
-  if (-not (Test-Path -LiteralPath $CSV_FILE)) { throw "CSV file not found: $CSV_FILE" }
-
-  $lines = Get-Content -LiteralPath $CSV_FILE | ForEach-Object { $_ -replace "`r$","" }
-  if ($lines.Count -lt 2) { Log "Migration Complete."; return }
-
-  foreach ($line in $lines[1..($lines.Count-1)]) {
-    if ([string]::IsNullOrWhiteSpace($line)) { continue }
-    $parts = $line -split ",", 8
-    while ($parts.Count -lt 8) { $parts += "" }
-
-    $s_org = $parts[0].Trim()
-    $s_repo = $parts[1].Trim()
-    $t_org = $parts[4].Trim()
-    $t_repo = $parts[5].Trim()
-    $reviewer_handle = $parts[7].Trim()
-
-    if (-not $s_org) { continue }
-    Log "Processing: $s_org/$s_repo -> $t_org/$t_repo"
-
-    if (-not $seen_orgs.ContainsKey($s_org)) {
-      Log " -> Syncing Org Vars for $t_org"
-      $orgVarsJson = $null
-      try { $orgVarsJson = Gh-Source -Args @("/orgs/$s_org/actions/variables") } catch { $orgVarsJson = $null }
-      if ($orgVarsJson) {
-        $orgVarsObj = $orgVarsJson | ConvertFrom-Json
-        $vars = @()
-        if ($null -ne $orgVarsObj.variables) { $vars = @($orgVarsObj.variables) }
-        foreach ($v in $vars) {
-          $n = [string]$v.name
-          $val = [string]$v.value
-          try {
-            Gh-Target -Args @("-X","POST","/orgs/$t_org/actions/variables","-f","name=$n","-f","value=$val","-f","visibility=all") | Out-Null
-          } catch {
-            try {
-              Gh-Target -Args @("-X","PATCH","/orgs/$t_org/actions/variables/$n","-f","name=$n","-f","value=$val") | Out-Null
-            } catch { }
+        $content = Get-Content -Path $item.LogFile -Raw
+        $newLen = $content.Length
+        if ($newLen -gt $item.LastOutputLength) {
+          $delta = $content.Substring($item.LastOutputLength)
+          $item.LastOutputLength = $newLen
+          if ($delta) {
+            Write-Host ""
+            $delta.TrimEnd("`r","`n") -split "(`r`n|`n|`r)" |
+              ForEach-Object {
+                if ($_ -ne '') { Write-Host $_ }
+              }
+            Show-StatusBar -queue $queue -inProgress $inProgress -migrated $migrated -failed $failed
           }
         }
-      }
-      $seen_orgs[$s_org] = 1
-    }
-
-    Log " -> Syncing Repo Vars"
-    $repoVarsJson = $null
-    try { $repoVarsJson = Gh-Source -Args @("/repos/$s_org/$s_repo/actions/variables") } catch { $repoVarsJson = $null }
-    if ($repoVarsJson) {
-      $repoVarsObj = $repoVarsJson | ConvertFrom-Json
-      $vars = @()
-      if ($null -ne $repoVarsObj.variables) { $vars = @($repoVarsObj.variables) }
-      foreach ($v in $vars) {
-        $n = [string]$v.name
-        $val = [string]$v.value
-        try {
-          Gh-Target -Args @("-X","POST","/repos/$t_org/$t_repo/actions/variables","-f","name=$n","-f","value=$val") | Out-Null
-        } catch {
-          try {
-            Gh-Target -Args @("-X","PATCH","/repos/$t_org/$t_repo/actions/variables/$n","-f","name=$n","-f","value=$val") | Out-Null
-          } catch { }
-        }
-      }
-    }
-
-    Log " -> Syncing Environments"
-    $envsJson = $null
-    try { $envsJson = Gh-Source -Args @("/repos/$s_org/$s_repo/environments") } catch { $envsJson = $null }
-    if ($envsJson) {
-      $envsObj = $envsJson | ConvertFrom-Json
-      $envNames = @()
-      if ($null -ne $envsObj.environments) { $envNames = @($envsObj.environments | ForEach-Object { $_.name }) }
-      foreach ($envName in $envNames) {
-        Sync-EnvironmentData -SrcFull "$s_org/$s_repo" -TgtFull "$t_org/$t_repo" -EnvName ([string]$envName) -ReviewerHandle $reviewer_handle
+      } catch {
+        # Ignore transient read errors while the job is writing
       }
     }
   }
 
-  Log "Migration Complete."
+  # --- Check completed/failed/stopped jobs ---
+  foreach ($item in @($inProgress)) {
+    if ($item.Job.State -in 'Completed','Failed','Stopped') {
+      $jobOutput = Receive-Job -Job $item.Job
+      Remove-Job -Job $item.Job
+
+      # Pick the last object that actually has the MigrationSuccess property
+      $result = $jobOutput |
+        Where-Object { $_ -is [hashtable] -and $_.ContainsKey('MigrationSuccess') } |
+        Select-Object -Last 1
+
+      if ($null -eq $result) {
+        $null = $failed.Add($item.Repo)
+        $item.Repo.Migration_Status = "Failure"
+      }
+      elseif ($result.MigrationSuccess -eq $true) {
+        $null = $migrated.Add($item.Repo)
+        $item.Repo.Migration_Status = "Success"
+      }
+      else {
+        $null = $failed.Add($item.Repo)
+        $item.Repo.Migration_Status = "Failure"
+      }
+
+      Write-MigrationStatusCsv
+      $inProgress.Remove($item)
+      Show-StatusBar -queue $queue -inProgress $inProgress -migrated $migrated -failed $failed
+    }
+  }
+
+  Start-Sleep -Seconds 5
 }
 
-Main
+Write-Host "`n[INFO] All migrations completed."
+Write-Host "[SUMMARY] Total: $($REPOS.Count) Migrated: $($migrated.Count) Failed: $($failed.Count)" -ForegroundColor Green
+Write-MigrationStatusCsv
+Write-Host "[INFO] Wrote migration results with Migration_Status column: $outputCsvPath" -ForegroundColor Cyan
+
+if ($failed.Count -gt 0) {
+  Write-Host "[WARNING] Migration completed with $($failed.Count) failures" -ForegroundColor Yellow
+  # Don't exit with error - let workflow handle it
+}
