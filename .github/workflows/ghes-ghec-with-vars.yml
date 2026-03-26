@@ -81,7 +81,6 @@ permissions:
   actions: write
 
 env:
-  # GH_TOKEN: ${{ secrets.GH_TOKEN }}
   GH_PAT: ${{ secrets.GH_PAT }}
   GH_SOURCE_PAT: ${{ secrets.GH_SOURCE_PAT }}
   GHES_API_URL: ${{ secrets.GHES_API_URL }}
