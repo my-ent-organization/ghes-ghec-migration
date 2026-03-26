@@ -18,6 +18,11 @@ GHES_API_URL="${GHES_API_URL%/}"  # trim trailing slash
 # Logging
 # ----------------------------
 LOG_FILE="validation-log-$(date +%Y%m%d).txt"
+# ----------------------------
+# Target
+# ----------------------------
+TARGET_HOST="${GH_TARGET_HOST:-github.com}"
+export GH_HOST="$TARGET_HOST"
 
 write_log() {
   local message="$1"
