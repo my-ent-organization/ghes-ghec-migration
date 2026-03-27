@@ -1,3 +1,3 @@
 ghes_org,ghes_repo,repo_url,repo_size_MB,github_org,github_repo,gh_repo_visibility,reviewer
-ghes-factory-demo,calotracker,https://antgrutta-07mubd.ghe-test.com/ghes-factory-demo/calotracker,2.96,test-19-yash,calotracker-yn-3,public,v-rbh
-ghes-factory-demo,mern_app,https://antgrutta-07mubd.ghe-test.com/ghes-factory-demo/mern_app,0.25,test-19-yash,mern_app-yn-3,private
+ghes-factory-demo,calotracker,https://antgrutta-07mubd.ghe-test.com/ghes-factory-demo/calotracker,2.96,maayon-enterprise,calotracker-yn-4,public,v-rbh
+ghes-factory-demo,mern_app,https://antgrutta-07mubd.ghe-test.com/ghes-factory-demo/mern_app,0.25,maayon-enterprise,mern_app-yn-4,private
