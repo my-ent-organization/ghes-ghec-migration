@@ -1,3 +1,3 @@
 ghes_org,ghes_repo,repo_url,repo_size_MB,github_org,github_repo,gh_repo_visibility,reviewer
-ghes-factory-demo,solar-system,https://antgrutta-07mubd.ghe-test.com/ghes-factory-demo/solar-system,2.02,my-ent-organization,solar-system-bha,private,bharath-rjendran
-ghes-factory-demo,calotracker,https://antgrutta-07mubd.ghe-test.com/ghes-factory-demo/calotracker,2.96,my-ent-organization,calotracker-bha,private,bharath-rjendran
+ghes-factory-demo,solar-system,https://antgrutta-07mubd.ghe-test.com/ghes-factory-demo/solar-system,2.02,my-ent-organization,solar-system-maa,private,bharath-rjendran
+ghes-factory-demo,calotracker,https://antgrutta-07mubd.ghe-test.com/ghes-factory-demo/calotracker,2.96,my-ent-organization,calotracker-maa,private,bharath-rjendran
