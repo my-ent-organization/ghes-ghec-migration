@@ -1,4 +1,4 @@
-name: ghe-sghec-with-vars-approver-gate
+name: ghes-ghec-with-vars-approver-gate
 
 on:
   workflow_dispatch:
